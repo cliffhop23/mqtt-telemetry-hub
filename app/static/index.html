@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MQTT Telemetry Hub</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+  <style>
+    :root { --bg:#0f1419; --card:#171e26; --line:#243040; --text:#e6edf3; --muted:#8b98a5; --accent:#4cc2ff; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif; background:var(--bg); color:var(--text); }
+    header { padding:18px 24px; border-bottom:1px solid var(--line); display:flex; align-items:baseline; gap:12px; }
+    h1 { font-size:18px; margin:0; }
+    .status { font-size:12px; color:var(--muted); margin-left:auto; }
+    .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#e5534b; margin-right:6px; }
+    .dot.live { background:#3fb950; }
+    main { display:grid; grid-template-columns: 320px 1fr; gap:16px; padding:16px 24px; }
+    @media (max-width: 860px) { main { grid-template-columns: 1fr; } }
+    .panel { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px; }
+    .panel h2 { font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); margin:0 0 10px; }
+    .device { padding:10px; border:1px solid var(--line); border-radius:8px; margin-bottom:10px; }
+    .device .name { font-weight:600; margin-bottom:6px; }
+    .metrics { display:flex; flex-wrap:wrap; gap:6px; }
+    .metric { font-size:12px; background:#0b1015; border:1px solid var(--line); border-radius:6px; padding:3px 7px; }
+    .metric b { color:var(--accent); font-weight:600; }
+    .empty { color:var(--muted); font-size:13px; }
+    canvas { width:100% !important; height:340px !important; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>MQTT Telemetry Hub</h1>
+    <span class="status"><span id="dot" class="dot"></span><span id="conn">connecting…</span></span>
+  </header>
+  <main>
+    <section class="panel">
+      <h2>Devices</h2>
+      <div id="devices" class="empty">Waiting for telemetry…</div>
+    </section>
+    <section class="panel">
+      <h2 id="chart-title">Live readings</h2>
+      <canvas id="chart"></canvas>
+    </section>
+  </main>
+  <script>
+    const MAX_POINTS = 120;
+    const state = { devices: {}, selected: null, series: {} };
+    const chart = new Chart(document.getElementById('chart'), {
+      type: 'line',
+      data: { labels: [], datasets: [] },
+      options: {
+        animation: false,
+        responsive: true,
+        maintainAspectRatio: false,
+        scales: {
+          x: { ticks: { color: '#8b98a5', maxTicksLimit: 8 }, grid: { color: '#1c2532' } },
+          y: { ticks: { color: '#8b98a5' }, grid: { color: '#1c2532' } }
+        },
+        plugins: { legend: { labels: { color: '#e6edf3', boxWidth: 10 } } }
+      }
+    });
+
+    function renderDevices() {
+      const root = document.getElementById('devices');
+      const ids = Object.keys(state.devices).sort();
+      if (!ids.length) { root.className = 'empty'; root.textContent = 'Waiting for telemetry…'; return; }
+      root.className = '';
+      root.innerHTML = ids.map(id => {
+        const metrics = Object.entries(state.devices[id]).map(
+          ([k, v]) => `<span class="metric">${k} <b>${Number(v).toFixed(2)}</b></span>`
+        ).join('');
+        return `<div class="device" data-id="${id}"><div class="name">${id}</div><div class="metrics">${metrics}</div></div>`;
+      }).join('');
+      root.querySelectorAll('.device').forEach(el => el.addEventListener('click', () => select(el.dataset.id)));
+    }
+
+    function select(id) {
+      state.selected = id;
+      state.series = {};
+      document.getElementById('chart-title').textContent = `Live readings — ${id}`;
+      chart.data.labels = [];
+      chart.data.datasets = [];
+      chart.update();
+    }
+
+    function push(reading) {
+      const { device, metric, value } = reading;
+      state.devices[device] = state.devices[device] || {};
+      state.devices[device][metric] = value;
+      if (!state.selected) select(device);
+      renderDevices();
+      if (device !== state.selected) return;
+      const series = (state.series[metric] = state.series[metric] || []);
+      series.push(value);
+      if (series.length > MAX_POINTS) series.shift();
+      const colors = ['#4cc2ff', '#3fb950', '#d29922', '#f778ba', '#a371f7'];
+      const index = Object.keys(state.series).indexOf(metric);
+      const dataset = chart.data.datasets.find(d => d.label === metric);
+      if (dataset) {
+        dataset.data = [...series];
+      } else {
+        chart.data.datasets.push({
+          label: metric, data: [...series], borderColor: colors[index % colors.length],
+          backgroundColor: 'transparent', tension: 0.25, pointRadius: 0, borderWidth: 2
+        });
+      }
+      chart.data.labels = series.map((_, i) => `${series.length - i}s`);
+      chart.update();
+    }
+
+    function connect() {
+      const ws = new WebSocket(`ws://${location.host}/ws`);
+      const dot = document.getElementById('dot');
+      const label = document.getElementById('conn');
+      ws.onopen = () => { dot.classList.add('live'); label.textContent = 'live'; };
+      ws.onclose = () => { dot.classList.remove('live'); label.textContent = 'reconnecting…'; setTimeout(connect, 2000); };
+      ws.onmessage = event => {
+        const msg = JSON.parse(event.data);
+        if (msg.type === 'hello') {
+          (msg.devices || []).forEach(d => { state.devices[d.device_id] = d.latest || {}; });
+          renderDevices();
+        } else if (msg.type === 'reading') {
+          push(msg);
+        }
+      };
+    }
+
+    fetch('/api/devices').then(r => r.json()).then(data => {
+      (data.items || []).forEach(d => { state.devices[d.device_id] = d.latest || {}; });
+      renderDevices();
+    });
+    connect();
+  </script>
+</body>
+</html>
